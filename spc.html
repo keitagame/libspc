@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>SPC Player</title>
+  <style>
+    </style>
+</head>
+<body>
+  <h1>LIB SPC</h1>
+  <input type="file" id="fileInput">
+
+
+<script src="https://cdn.jsdelivr.net/gh/keitagame/libspc/libspc.min.js"></script>
+<script>
+  let spcplayer = new SPCPlayer();
+ document.getElementById('fileInput').addEventListener('change', function(event) {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+
+    
+    reader.onload = function(e) {
+      
+      const arrayBuffer = e.target.result;
+
+      const uint8Array = new Uint8Array(arrayBuffer);
+      
+
+      spcplayer.load(arrayBuffer);
+      spcplayer.stop();
+      spcplayer.play();
+    };
+
+    // ファイルを ArrayBuffer として読み込み開始
+    reader.readAsArrayBuffer(file);
+  });
+</script>
+</body>
+</html>
