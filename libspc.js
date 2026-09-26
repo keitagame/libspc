@@ -1427,7 +1427,8 @@ class SPCPlayer {
 
       if (fade < fadeTarget) { fade = Math.min(fadeTarget, fade + fadeStep); }
       else if (fade > fadeTarget) { fade = Math.max(fadeTarget, fade - fadeStep); }
-      
+      l = l * 5;
+      r = r * 5;
       const g = 0.5 - 0.5 * Math.cos(Math.PI * fade);
       left[i] = l * g;
       right[i] = r * g;
