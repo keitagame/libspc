@@ -999,17 +999,23 @@ class DSP {
     this.clockNoise();
 
     let mixL = 0, mixR = 0;
-    let eMixL = 0, eMixR = 0;
-    const konReg = this.kon | (this._pendingKon || 0);
+    let eMixL = 0, eMixR = 0; // EONが立っているボイスだけをエコーへ送る
+
+    const pendingKon = this._pendingKon || 0;
+    const konReg = this.kon;
     const koffReg = this.koff;
-    const resetFlag = (this.flg & 0x80) !== 0;
+    const resetFlag = (this.flg & 0x80) !== 0;   // FLG bit7: ソフトリセット
     this._pendingKon = 0;
 
     for (let i = 0; i < 8; i++) {
       const voice = this.voices[i];
       const bit = 1 << i;
 
-      if (konReg & bit) {
+      // 新規のKON書き込み(pendingKon)があれば、既存のラッチ状態に関わらず強制再トリガー
+      if (pendingKon & bit) {
+        this._triggerKeyOn(voice, i);
+        voice._konLatched = true;
+      } else if (konReg & bit) {
         if (!voice._konLatched) {
           this._triggerKeyOn(voice, i);
           voice._konLatched = true;
@@ -1017,6 +1023,8 @@ class DSP {
       } else {
         voice._konLatched = false;
       }
+
+      // KOFF、または FLG bit7(RESET) でリリースへ。RESET 中はエンベロープも即 0。
       voice.keyOff = ((koffReg & bit) !== 0) || resetFlag;
       if (resetFlag) {
         voice.envLevel = 0;
