@@ -633,7 +633,7 @@ class SPC700 {
  */
 const SDSP_RATE = 32000;
 const OUTPUT_HEADROOM = 1.0;
-const LP_CUTOFF_HZ = 6000;
+const LP_CUTOFF_HZ = 30000;
 const LP_ALPHA = 1 - Math.exp(-2 * Math.PI * LP_CUTOFF_HZ / SDSP_RATE);
 
 function softClip(x) {
@@ -653,7 +653,42 @@ const COUNTER_RATES = [
   0, 2048, 1536, 1280, 1024, 768, 640, 512, 384, 320, 256, 192,
   160, 128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3, 2, 1
 ];
+// --- タップ数の設定（6 または 8 などを指定）---
+const TAPS = 6; 
+const HALF_TAPS = TAPS / 2;
 
+const SINC_TABLE = (() => {
+  const table = new Float32Array(256 * TAPS);
+  const sinc = (x) => {
+    if (Math.abs(x) < 1e-6) return 1.0;
+    const px = Math.PI * x;
+    return Math.sin(px) / px;
+  };
+  const windowedSinc = (x) => {
+    const ax = Math.abs(x);
+    if (ax >= HALF_TAPS) return 0.0;
+    return sinc(x) * sinc(x / HALF_TAPS); // Lanczos 窓関数
+  };
+
+  for (let i = 0; i < 256; i++) {
+    const t = i / 256.0;
+    let sum = 0;
+
+    // TAPS分の重みを計算
+    for (let k = 0; k < TAPS; k++) {
+      const x = (1 - HALF_TAPS + k) - t;
+      const w = windowedSinc(x);
+      table[i * TAPS + k] = w;
+      sum += w;
+    }
+
+    // 重みの正規化（音量の変動・歪みを防止）
+    for (let k = 0; k < TAPS; k++) {
+      table[i * TAPS + k] /= sum;
+    }
+  }
+  return table;
+})();
 const GAUSS_TABLE = new Int16Array([
   0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000, 0x000,
   0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x001, 0x002, 0x002, 0x002, 0x002, 0x002,
@@ -697,13 +732,14 @@ class DSP {
 
     this.voices = [];
     for (let i = 0; i < 8; i++) {
+      
       this.voices.push({
         brrAddr: 0,
         brrOffset: 0,
         pitchCounter: 0,
         history: [0, 0],
         decodedBlock: new Int16Array(16),
-        interp: new Float64Array(4),
+        interp: new Float64Array(6),
         curBlockHeader: 0,
         keyOn: false,
         keyOff: false,
@@ -716,8 +752,8 @@ class DSP {
         konDelay: 0,
       });
     }
-
-    this.gaussTable = GAUSS_TABLE;
+    this.sincTable = SINC_TABLE;
+    //this.gaussTable = GAUSS_TABLE;
     this.noiseLFSR = 0x4000;
     this.masterVolL = 0;
     this.masterVolR = 0;
@@ -803,7 +839,10 @@ class DSP {
     const loop = this.ram[base + 2] | (this.ram[base + 3] << 8);
     return { start, loop };
   }
-
+getDSPRegisters() {
+ 
+  return new Uint8Array(this.regs);
+}
   decodeBrrBlock(voice, addr, voiceIdx) {
     const header = this.ram[addr];
     const range = (header >> 4) & 0x0f;
@@ -1059,15 +1098,16 @@ class DSP {
       if (p > 0x3fff) p = 0x3fff;
 
       const gi = (voice.pitchCounter >> 4) & 0xff;
-      const gt = this.gaussTable;
+      const stIdx = gi * TAPS;
       const ip = voice.interp;
-      let gs = (gt[255 - gi] * ip[0]) >> 10;
-      gs += (gt[511 - gi] * ip[1]) >> 10;
-      gs += (gt[256 + gi] * ip[2]) >> 10;
-      gs = (gs << 16) >> 16;
-      gs += (gt[gi] * ip[3]) >> 10;
+
+      let gs = 0;
+      for (let k = 0; k < TAPS; k++) {
+        gs += ip[k] * this.sincTable[stIdx + k];
+      }
+
       if (gs > 32767) gs = 32767; else if (gs < -32768) gs = -32768;
-      let sample = gs >> 1;
+      let sample = Math.round(gs) >> 1;
 
       if (this.non & bit) {
         sample = this.noiseSample();
