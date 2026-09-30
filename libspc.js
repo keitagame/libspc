@@ -633,7 +633,7 @@ class SPC700 {
  */
 const SDSP_RATE = 32000;
 const OUTPUT_HEADROOM = 1.0;
-const LP_CUTOFF_HZ = 30000;
+const LP_CUTOFF_HZ = 3000;
 const LP_ALPHA = 1 - Math.exp(-2 * Math.PI * LP_CUTOFF_HZ / SDSP_RATE);
 
 function softClip(x) {
@@ -654,7 +654,7 @@ const COUNTER_RATES = [
   160, 128, 96, 80, 64, 48, 40, 32, 24, 20, 16, 12, 10, 8, 6, 5, 4, 3, 2, 1
 ];
 // --- タップ数の設定（6 または 8 などを指定）---
-const TAPS = 6; 
+const TAPS = 4; 
 const HALF_TAPS = TAPS / 2;
 
 const SINC_TABLE = (() => {
@@ -739,7 +739,7 @@ class DSP {
         pitchCounter: 0,
         history: [0, 0],
         decodedBlock: new Int16Array(16),
-        interp: new Float64Array(6),
+        interp: new Float64Array(4),
         curBlockHeader: 0,
         keyOn: false,
         keyOff: false,
