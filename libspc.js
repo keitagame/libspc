@@ -633,7 +633,7 @@ class SPC700 {
  */
 const SDSP_RATE = 32000;
 const OUTPUT_HEADROOM = 1.0;
-const LP_CUTOFF_HZ = 3000;
+const LP_CUTOFF_HZ = 7000;
 const LP_ALPHA = 1 - Math.exp(-2 * Math.PI * LP_CUTOFF_HZ / SDSP_RATE);
 
 function softClip(x) {
@@ -842,6 +842,39 @@ class DSP {
 getDSPRegisters() {
  
   return new Uint8Array(this.regs);
+}
+getAllVoiceStates() {
+    return this.voices.map((v, i) => {
+      const regs = this.getVoiceRegisters(i);
+      return {
+        id: i,
+        // 内部リアルタイム状態
+        outSample: v.outSample, // -32768 ~ 32767 (直近の出力値)
+        envLevel: v.envLevel,   // 0 ~ 2047 (エンベロープ値)
+        envMode: v.envMode,     // 'off', 'attack', 'decay', 'sustain', 'release', 'kon-delay'
+        // レジスタ設定値
+        volL: regs.volL,        // -128 ~ 127
+        volR: regs.volR,        // -128 ~ 127
+        pitch: regs.pitch,      // 0 ~ 16383 (ピッチ周波数)
+        srcn: regs.srcn         // 波形ソース番号
+      };
+    });
+  }
+getVoiceRegisters(v) {
+  if (v < 0 || v > 7) return null;
+  const base = v * 0x10;
+  
+  return {
+    volL:  this.regs[base + 0x00], // 左音量 (-128 ~ 127)
+    volR:  this.regs[base + 0x01], // 右音量 (-128 ~ 127)
+    pitch: this.regs[base + 0x02] | (this.regs[base + 0x03] << 8), // ピッチ周波数 (14bit)
+    srcn:  this.regs[base + 0x04], // 波形ソース番号
+    adsr1: this.regs[base + 0x05], // ADSR1
+    adsr2: this.regs[base + 0x06], // ADSR2
+    gain:  this.regs[base + 0x07], // GAIN
+    env:   this.regs[base + 0x08], // 現在のエンデロープ値 (0 ~ 127)
+    out:   this.regs[base + 0x09]  // 直近の出力値
+  };
 }
   decodeBrrBlock(voice, addr, voiceIdx) {
     const header = this.ram[addr];
@@ -1170,8 +1203,8 @@ getDSPRegisters() {
 
     if (this.flg & 0x40) { outL = 0; outR = 0; }
 
-    outL = softClip(outL);
-    outR = softClip(outR);
+    outL = softClip(outL) * 5;
+    outR = softClip(outR) * 5;
 
     {
       const R_DC = 0.99843;
@@ -1275,7 +1308,6 @@ class SPCEngine {
     cpu.Y = parsed.y & 0xff;
     cpu.SP = parsed.sp & 0xff;
     cpu.PC = parsed.pc & 0xffff;
-    cpu.setPSW(parsed.psw);
     cpu.cycles = 0;
 
     const f1 = parsed.ram[0xf1];
@@ -1297,32 +1329,14 @@ class SPCEngine {
     dsp.regs.set(parsed.dspRegs);
     dsp.regs[0x7c] = parsed.dspRegs[0x7c];
 
-    const konSnapshot = parsed.dspRegs[0x4c];
+    // 【修正】キーオンのラッチ状態をリセットし、曲冒頭の発音命令がスキップされないように修正
     for (let i = 0; i < 8; i++) {
-      const v = dsp.voices[i];
-      v._konLatched = ((konSnapshot >> i) & 1) === 1;
-      const envx = parsed.dspRegs[i * 0x10 + 0x08];
-      if (envx > 0) {
-        v.envLevel = Math.min(2047, envx << 4);
-        v.envMode = 'sustain';
-        const dirEntry = dsp.getSampleDirEntry(dsp.srcn(i));
-        v.brrAddr = dirEntry.start;
-        v.pitchCounter = 0;
-        v.history = [0, 0];
-        v.endFlag = false;
-        v.loopFlag = false;
-        dsp.decodeBrrBlock(v, v.brrAddr, i);
-        dsp.regs[0x7c] = parsed.dspRegs[0x7c];
-        v.interp[0] = 0; v.interp[1] = 0; v.interp[2] = 0;
-        v.interp[3] = v.decodedBlock[0];
-        v.brrOffset = 1;
-      }
+      dsp.voices[i]._konLatched = false;
     }
 
     this.loaded = true;
     this._cycleAccum = 0;
   }
-
   renderSample() {
     if (!this.loaded) return [0, 0];
 
@@ -1339,6 +1353,9 @@ class SPCEngine {
   }
 }
 
+/**
+ * Main Audio Player & Public API
+ */
 /**
  * Main Audio Player & Public API
  */
@@ -1366,20 +1383,78 @@ class SPCPlayer {
     this.scriptNode.onaudioprocess = (e) => this._process(e);
     this._connected = false;
     this.currentMeta = null;
+
+    // --- シーク・時間管理用プロパティ ---
+    this.rawBuffer = null;      // 高速再構築用のArrayBufferキャッシュ
+    this.playedSamples = 0;     // 内部生成したDSPサンプル数(32kHz基準)
+    this.isSeeking = false;     // シーク処理中フラグ
+  }
+
+  /**
+   * 現在の再生位置（秒）を取得
+   */
+  get currentTime() {
+    return this.playedSamples / SDSP_SAMPLE_RATE;
   }
 
   /**
    * SPCファイルをArrayBufferまたはUint8Arrayからロード
    */
   load(buffer) {
-    const parsed = parseSPC(buffer);
+    // 再生成用にBufferを複製して保存
+    if (buffer instanceof ArrayBuffer) {
+      this.rawBuffer = buffer.slice(0);
+    } else if (ArrayBuffer.isView(buffer)) {
+      this.rawBuffer = buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + buffer.byteLength);
+    }
+
+    const parsed = parseSPC(this.rawBuffer);
     this.engine.loadSPC(parsed);
     this.currentMeta = parsed.meta;
     this.srcPos = 0;
     this.haveSample = false;
     this.hL.fill(0); this.hR.fill(0);
     this.fade = 0;
+    this.playedSamples = 0;
     return parsed.meta;
+  }
+
+  /**
+   * 指定した位置（秒）へシーク（好きな場所から再生）
+   * @param {number} seconds - 再生したい位置（秒）
+   */
+  seek(seconds) {
+    if (!this.rawBuffer || !this.engine.loaded) return;
+
+    const targetSeconds = Math.max(0, seconds);
+    const targetSamples = Math.floor(targetSeconds * SDSP_SAMPLE_RATE);
+
+    const wasPlaying = this.playing;
+    this.isSeeking = true;
+
+    // 1. 初期状態にリセット
+    const parsed = parseSPC(this.rawBuffer);
+    this.engine.loadSPC(parsed);
+    this.srcPos = 0;
+    this.haveSample = false;
+    this.hL.fill(0); this.hR.fill(0);
+
+    // 2. 指定位置まで高速レンダリング（音声出力なしでCPU/DSPを進める）
+    for (let i = 0; i < targetSamples; i++) {
+      this.engine.renderSample();
+    }
+
+    this.playedSamples = targetSamples;
+    this.isSeeking = false;
+
+    // 再生中だった場合は再生状態を復元
+    if (wasPlaying) {
+      this.play();
+    }
+  }
+
+  getVoiceStates() {
+    return this.engine.dsp.getAllVoiceStates();
   }
 
   /**
@@ -1433,6 +1508,7 @@ class SPCPlayer {
     hR[0] = hR[1]; hR[1] = hR[2]; hR[2] = hR[3];
     const [l, r] = this.engine.renderSample();
     hL[3] = l; hR[3] = r;
+    this.playedSamples++; // 再生サンプル数をカウント
   }
 
   static _cubic(y0, y1, y2, y3, t) {
@@ -1448,7 +1524,8 @@ class SPCPlayer {
     const right = output.getChannelData(1);
     const n = left.length;
 
-    if (!this.playing || !this.engine.loaded) {
+    // シーク中や停止中・未読み込み時は無音を出力
+    if (!this.playing || !this.engine.loaded || this.isSeeking) {
       left.fill(0);
       right.fill(0);
       return;
@@ -1465,58 +1542,26 @@ class SPCPlayer {
     const fadeTarget = this.fadeTarget, fadeStep = this.fadeStep;
 
     for (let i = 0; i < n; i++) {
-      while (this.srcPos >= 1) {
+      while (this.srcPos >= 1.0) {
         this._advanceDspSample();
-        this.srcPos -= 1;
+        this.srcPos -= 1.0;
       }
-      const t = this.srcPos;
-      let l = SPCPlayer._cubic(hL[0], hL[1], hL[2], hL[3], t);
-      let r = SPCPlayer._cubic(hR[0], hR[1], hR[2], hR[3], t);
 
-      if (fade < fadeTarget) { fade = Math.min(fadeTarget, fade + fadeStep); }
-      else if (fade > fadeTarget) { fade = Math.max(fadeTarget, fade - fadeStep); }
-      l = l * 5;
-      r = r * 5;
-      const g = 0.5 - 0.5 * Math.cos(Math.PI * fade);
-      left[i] = l * g;
-      right[i] = r * g;
+      const l = SPCPlayer._cubic(hL[0], hL[1], hL[2], hL[3], this.srcPos);
+      const r = SPCPlayer._cubic(hR[0], hR[1], hR[2], hR[3], this.srcPos);
+
+      if (fade !== fadeTarget) {
+        if (fade < fadeTarget) fade = Math.min(fadeTarget, fade + fadeStep);
+        else fade = Math.max(fadeTarget, fade - fadeStep);
+      }
+
+      left[i] = l * fade;
+      right[i] = r * fade;
 
       this.srcPos += ratio;
     }
+
     this.fade = fade;
-  }
-
-  // --- シングルトン / リンク共有機能 ---
-  static getInstance() {
-    if (!SPCPlayer._sharedInstance) {
-      SPCPlayer._sharedInstance = new SPCPlayer();
-    }
-    return SPCPlayer._sharedInstance;
-  }
-
-  /**
-   * ページ内の <a> リンク(または拡張子 .spc を含むリンク)のクリックイベントを監視し、
-   * 自動的にSPCとして再生を開始させるバインド機能
-   * @param {string} selector - 対象リンクのCSSセレクタ (省略時: a[href$=".spc"], a[data-spc])
-   */
-  static bindLinks(selector = 'a[href$=".spc"], a[href*=".spc?"], a[data-spc]') {
-    document.addEventListener('click', (e) => {
-      const link = e.target.closest(selector);
-      if (link && link.href) {
-        e.preventDefault();
-        const player = SPCPlayer.getInstance();
-        player.loadUrl(link.href).catch(err => console.error('SPC load error:', err));
-      }
-    });
-  }
-}
-
-// 自動的にDOM構築完了時に <a> リンクバインドを設定
-if (typeof document !== 'undefined') {
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => SPCPlayer.bindLinks());
-  } else {
-    SPCPlayer.bindLinks();
   }
 }
 
@@ -1528,3 +1573,96 @@ if (typeof window !== 'undefined') {
 if (typeof module !== 'undefined' && module.exports) {
   module.exports = { SPCPlayer, parseSPC, SPC700, DSP, SPCEngine };
 }
+// ============================================================================
+// WAV Export Extension
+// ============================================================================
+
+/**
+ * PCMデータ(Float32Array)から16bit StereoのWAV Blobを生成
+ */
+function createWavBlob(leftChannel, rightChannel, sampleRate = SDSP_SAMPLE_RATE) {
+  const numChannels = 2;
+  const numSamples = leftChannel.length;
+  const bytesPerSample = 2; // 16-bit PCM
+  const blockAlign = numChannels * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = numSamples * blockAlign;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeString = (v, offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      v.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  /* RIFF header */
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + dataSize, true);
+  writeString(view, 8, 'WAVE');
+
+  /* fmt chunk */
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);          // Subchunk1Size (16 for PCM)
+  view.setUint16(20, 1, true);           // AudioFormat (1 = PCM)
+  view.setUint16(22, numChannels, true); // NumChannels
+  view.setUint32(24, sampleRate, true);  // SampleRate
+  view.setUint32(28, byteRate, true);    // ByteRate
+  view.setUint16(32, blockAlign, true);  // BlockAlign
+  view.setUint16(34, 16, true);          // BitsPerSample
+
+  /* data chunk */
+  writeString(view, 36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  /* Write Interleaved PCM samples */
+  let offset = 44;
+  for (let i = 0; i < numSamples; i++) {
+    let l = Math.max(-1, Math.min(1, leftChannel[i]));
+    let r = Math.max(-1, Math.min(1, rightChannel[i]));
+
+    let sL = l < 0 ? l * 0x8000 : l * 0x7FFF;
+    let sR = r < 0 ? r * 0x8000 : r * 0x7FFF;
+
+    view.setInt16(offset, sL, true);
+    view.setInt16(offset + 2, sR, true);
+    offset += 4;
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+/**
+ * SPCデータ(ArrayBuffer)を直接WAV Blobにレンダリングする独立関数
+ * @param {ArrayBuffer|Uint8Array} spcBuffer - SPCバイナリデータ
+ * @param {number} durationSec - 出力する長さ（秒数）
+ * @returns {Blob} WAVファイルのBlob
+ */
+function renderSPCToWav(spcBuffer, durationSec = 180) {
+  const parsed = parseSPC(spcBuffer);
+  const engine = new SPCEngine();
+  engine.loadSPC(parsed);
+
+  const sampleRate = SDSP_SAMPLE_RATE; // 32000Hz
+  const totalSamples = Math.floor(sampleRate * Math.max(0, durationSec));
+
+  const leftChannel = new Float32Array(totalSamples);
+  const rightChannel = new Float32Array(totalSamples);
+
+  for (let i = 0; i < totalSamples; i++) {
+    const [l, r] = engine.renderSample();
+    leftChannel[i] = l;
+    rightChannel[i] = r;
+  }
+
+  return createWavBlob(leftChannel, rightChannel, sampleRate);
+}
+
+// SPCPlayerクラスにWAVエクスポート機能を追加
+SPCPlayer.prototype.exportWav = function (durationSec = 180, buffer = null) {
+  const targetBuffer = buffer || this.rawBuffer;
+  if (!targetBuffer) {
+    throw new Error('No SPC buffer available for WAV export.');
+  }
+  return renderSPCToWav(targetBuffer, durationSec);
+};
