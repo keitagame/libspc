@@ -5,6 +5,67 @@
 /**
  * SPC700 CPU Emulator
  */
+// ============================================================================
+// リアル音響エフェクト（臨場感向上処理）
+// ============================================================================
+
+// アナログ真空管・テープ風の温かみと滑らかなダイナミクスを与えるサチュレーション
+function analogSaturation(x) {
+  return Math.tanh(x * 1.15) * 0.9;
+}
+
+// 空間の奥行きと広がりを生み出すアーリーリフレクション（初期反射音）
+class EarlyReflections {
+  constructor(sampleRate = 32000) {
+    this.bufferL = new Float32Array(2048);
+    this.bufferR = new Float32Array(2048);
+    this.pos = 0;
+    
+    // 反射音のディレイタイム（ミリ秒）と減衰量
+    this.tapsL = [
+      { delay: Math.floor(sampleRate * 0.011), gain: 0.22 },
+      { delay: Math.floor(sampleRate * 0.024), gain: 0.15 },
+      { delay: Math.floor(sampleRate * 0.038), gain: 0.10 }
+    ];
+    this.tapsR = [
+      { delay: Math.floor(sampleRate * 0.014), gain: 0.20 },
+      { delay: Math.floor(sampleRate * 0.029), gain: 0.13 },
+      { delay: Math.floor(sampleRate * 0.042), gain: 0.08 }
+    ];
+  }
+
+  reset() {
+    this.bufferL.fill(0);
+    this.bufferR.fill(0);
+    this.pos = 0;
+  }
+
+  process(inL, inR) {
+    const mask = 2047;
+    this.bufferL[this.pos] = inL;
+    this.bufferR[this.pos] = inR;
+
+    let refL = 0, refR = 0;
+    for (let i = 0; i < this.tapsL.length; i++) {
+      const t = this.tapsL[i];
+      refL += this.bufferL[(this.pos - t.delay) & mask] * t.gain;
+    }
+    for (let i = 0; i < this.tapsR.length; i++) {
+      const t = this.tapsR[i];
+      refR += this.bufferR[(this.pos - t.delay) & mask] * t.gain;
+    }
+
+    this.pos = (this.pos + 1) & mask;
+    return [inL + refL, inR + refR];
+  }
+}
+
+// ステレオ感を自然に広げる Mid-Side エンハンサー
+function applyStereoEnhancer(inL, inR, width = 1.3) {
+  const mid = (inL + inR) * 0.5;
+  const side = (inL - inR) * 0.5 * width;
+  return [mid + side, mid - side];
+}
 class SPC700 {
   constructor(dsp) {
     this.dsp = dsp;
@@ -729,7 +790,7 @@ class DSP {
     this.ram = ram;
     this.regs = new Uint8Array(128);
     this.regAddr = 0;
-
+    this.er = new EarlyReflections(SDSP_RATE);
     this.voices = [];
     for (let i = 0; i < 8; i++) {
       
@@ -776,6 +837,7 @@ class DSP {
     this._pendingKon = 0;
     this.echoOffset = 0;
     this.echoLength = 4;
+    this.er.reset();
     this.firHistL.fill(0); this.firHistR.fill(0); this.firPos = 0;
     this.dcPrevInL = this.dcPrevOutL = this.dcPrevInR = this.dcPrevOutR = 0;
     this.lpL = this.lpR = 0;
@@ -1198,14 +1260,24 @@ getVoiceRegisters(v) {
     let dr = ((mixR * this.mvolR) >> 7) + ((echoOutR * this.evolR) >> 7);
     if (dl > 32767) dl = 32767; else if (dl < -32768) dl = -32768;
     if (dr > 32767) dr = 32767; else if (dr < -32768) dr = -32768;
-    let outL = dl / (32768 * OUTPUT_HEADROOM);
-    let outR = dr / (32768 * OUTPUT_HEADROOM);
+
+    // 1. 正規化
+    let outL = dl / 32768.0;
+    let outR = dr / 32768.0;
 
     if (this.flg & 0x40) { outL = 0; outR = 0; }
 
-    outL = softClip(outL) * 5;
-    outR = softClip(outR) * 5;
+    // 2. 空間アーリーリフレクション（空間の奥行き・部屋の残響感を付与）
+    [outL, outR] = this.er.process(outL, outR);
 
+    // 3. ステレオエンハンサー（横方向の音場の広がりを強調）
+    [outL, outR] = applyStereoEnhancer(outL, outR, 1.3);
+
+    // 4. アナログサチュレーション（温かみのある音圧と歪み防止）
+    outL = analogSaturation(outL);
+    outR = analogSaturation(outR);
+
+    // 5. DCオフセット除去フィルター
     {
       const R_DC = 0.99843;
       const yl = outL - this.dcPrevInL + R_DC * this.dcPrevOutL;
@@ -1214,12 +1286,14 @@ getVoiceRegisters(v) {
       this.dcPrevInR = outR; this.dcPrevOutR = yr; outR = yr;
     }
 
+    // 6. ローパスフィルター（高音域の角を取り滑らかに仕上げ）
     {
       this.lpL += LP_ALPHA * (outL - this.lpL); outL = this.lpL;
       this.lpR += LP_ALPHA * (outR - this.lpR); outR = this.lpR;
     }
 
     return [outL, outR];
+  
   }
 
   _triggerKeyOn(voice, i) {
@@ -1400,6 +1474,7 @@ class SPCPlayer {
   /**
    * SPCファイルをArrayBufferまたはUint8Arrayからロード
    */
+  
   load(buffer) {
     // 再生成用にBufferを複製して保存
     if (buffer instanceof ArrayBuffer) {
@@ -1484,6 +1559,7 @@ class SPCPlayer {
     }
     this.playing = true;
     this.fadeTarget = 1;
+     this._startVoiceTimer();
   }
 
   /**
@@ -1517,7 +1593,34 @@ class SPCPlayer {
     const c = -0.5 * y0            + 0.5 * y2;
     return ((a * t + b) * t + c) * t + y1;
   }
+  _startVoiceTimer() {
+    if (this._voiceTimer) return;
+    this._voiceTimer = setInterval(() => {
+      if (typeof this.onVoiceInfo === 'function' && this.engine.loaded) {
+        this.onVoiceInfo(this._getVoiceInfo());
+      }
+    }, 2);
+  }
+  _stopVoiceTimer() {
+    if (this._voiceTimer) { clearInterval(this._voiceTimer); this._voiceTimer = null; }
+  }
 
+  _getVoiceInfo() {
+    const dsp = this.engine.dsp;
+    const voices = [];
+    for (let i = 0; i < 8; i++) {
+      const voice = dsp.voices[i];
+      voices.push({
+        voice: i + 1,
+        volumeL: dsp.volL(i),
+        volumeR: dsp.volR(i),
+        pitch: dsp.pitch(i),
+        envelope: voice.envLevel,
+        active: voice.envMode !== "off"
+      });
+    }
+    return voices;
+  }
   _process(e) {
     const output = e.outputBuffer;
     const left = output.getChannelData(0);
@@ -1666,3 +1769,15 @@ SPCPlayer.prototype.exportWav = function (durationSec = 180, buffer = null) {
   }
   return renderSPCToWav(targetBuffer, durationSec);
 };
+function pitchToNote(pitch) {
+    if (!pitch) return "-";
+    const freq = 32000 * pitch / 4096;
+    if (!isFinite(freq) || freq <= 0) return "-";
+
+    const noteNames = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+    const midi = Math.round(69 + 12 * Math.log2(freq / 440));
+    const octave = Math.floor(midi / 12) - 1;
+    const name = noteNames[((midi % 12) + 12) % 12];
+
+    return `${name}${octave}`;
+}
